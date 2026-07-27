@@ -266,9 +266,14 @@ COMPILATIONS = [
 # Eventos de PMU -- ESTRATEGIA SEM MULTIPLEXACAO
 #
 # O i5-7400 tem 4 contadores programaveis + 2 fixos (cycles, instructions).
-# Grupo unico com 5 eventos: cycles (fixo), instructions (fixo),
-# branches, branch-misses, L1-dcache-loads (3 dos 4 programaveis).
-# Resultado: zero multiplexacao, uma unica execucao por cenario.
+# Grupo unico de 6 eventos:
+#   cycles       (fixo)
+#   instructions (fixo)
+#   branches     (programavel 1/4)
+#   branch-misses(programavel 2/4)
+#   L1-dcache-loads (programavel 3/4)
+#   cpu-clock    (SOFTWARE -- nao consome contador de hardware)
+# Resultado: 3 dos 4 programaveis usados, zero multiplexacao.
 #
 # Analise de cache (L1/L2/L3/RAM) vem exclusivamente do perf mem (PEBS).
 # ============================================================================
@@ -279,6 +284,7 @@ PERF_EVENTS = [
     "branches",
     "branch-misses",
     "L1-dcache-loads",
+    "cpu-clock",       # evento de software: tempo de CPU em ns (calcula avg_clock_ghz)
 ]
 
 # Latencia ideal de L1 no i5-7400 (ciclos)
@@ -496,12 +502,15 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
         binary_path, prompt_tokens_str, gen_len, perf_available
     )
 
-    # --- Metricas derivadas (apenas IPC, branch-miss-rate, IPL) ---
+    # --- Metricas derivadas ---
     cycles        = raw_stats.get("cycles", 0)
     instructions  = raw_stats.get("instructions", 0)
     branches      = raw_stats.get("branches", 0)
     branch_misses = raw_stats.get("branch-misses", 0)
     l1_loads      = raw_stats.get("L1-dcache-loads", 0)
+    # cpu-clock: evento de software que retorna tempo de CPU em nanosegundos.
+    # GHz = ciclos / nanosegundos  (cycles/ns == 10^9 cycles/s == GHz)
+    cpu_clock_ns  = raw_stats.get("cpu-clock", 0)
 
     all_stats = dict(raw_stats)
 
@@ -511,6 +520,8 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
         all_stats["branch-miss-rate (%)"] = round((branch_misses / branches) * 100, 2)
     if l1_loads > 0 and instructions > 0:
         all_stats["IPL"] = round(instructions / l1_loads, 2)
+    if cpu_clock_ns > 0 and cycles > 0:
+        all_stats["avg_clock_ghz"] = round(cycles / cpu_clock_ns, 4)
 
     if not perf_available:
         return stdout_str, all_stats, []
@@ -675,7 +686,7 @@ def run_perf_mem_latency(binary_path: str, prompt_tokens_str: str, gen_len: int,
     env["WEIGHTS_FILE"] = WEIGHTS_FILE
 
     perf_mem_data = os.path.join(BASE_DIR, "perf_mem.data")
-    cmd_rec = ["perf", "mem", "record", "-o", perf_mem_data, binary_path] + prompt_tokens_str.split()
+    cmd_rec = ["perf", "mem", "record", "--ldlat", "3", "-o", perf_mem_data, binary_path] + prompt_tokens_str.split()
     proc = subprocess.run(cmd_rec, env=env, cwd=SHARED_DIR, capture_output=True, text=True)
 
     if not os.path.exists(perf_mem_data):
