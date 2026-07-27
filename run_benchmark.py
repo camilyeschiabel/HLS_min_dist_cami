@@ -1,16 +1,20 @@
 """
 run_benchmark.py
-Benchmark unificado — BitNet b1.58 (2B-4T) HLS Simulation
-Hardware: AMD Ryzen 5 7520U (Zen 3+)
+Benchmark unificado -- BitNet b1.58 (2B-4T) HLS Simulation
+Hardware: Intel Core i5-7400 (Kaby Lake)
 
-VERSÃO 3.0 - UNIFICADO (HLS_min_dist_unified)
+VERSAO 4.0 - UNIFICADO (HLS_min_dist_unified)
 ===============================================
-- Adaptado para o diretório unificado: código e dados (.bin) estão
-  na mesma pasta. Não há mais SHARED_DIR separado.
-- Seleciona versão via argumento --version (1, 2) e passa -DBITNET_VERSION
-  na compilação.
-- Usa grupos de eventos AMD Zen 3+ (sem multiplexação).
-- Mantém todos os cenários, compilações e relatório do formato original.
+- Adaptado para o diretorio unificado: codigo e dados (.bin) estao
+  na mesma pasta. Nao ha mais SHARED_DIR separado.
+- Seleciona versao via argumento --version (0, 1, 2) e passa -DBITNET_VERSION
+  na compilacao.
+- Usa um unico grupo de 5 eventos perf stat (sem multiplexacao).
+  O i5-7400 tem 4 contadores programaveis + 2 fixos (cycles, instructions).
+  Grupo: cycles (fixo), instructions (fixo), branches, branch-misses,
+         L1-dcache-loads (3 dos 4 programaveis -- zero multiplexacao).
+- Analise de cache vem exclusivamente do perf mem (PEBS).
+- Mantém todos os cenarios, compilacoes e relatorio do formato original.
 """
 import os
 import sys
@@ -45,7 +49,7 @@ VERSION    = "HLS_min_dist_unified"
 # WEIGHTS_FILE é definido após parse de argumentos (veja main()).
 WEIGHTS_FILE = "weights.bin"  # default; substituído em main()
 
-CPU_LABEL = "AMD Ryzen 5 7520U (Zen 3+)"
+CPU_LABEL = "Intel Core i5-7400 (Kaby Lake)"
 
 
 # ============================================================================
@@ -206,16 +210,34 @@ SCENARIO_SPECS = [
     {
         "id": "short_short",
         "name": "Short Prompt, Short Gen",
+        "focus": "Decode pesado, prefill leve",
         "prompt_text": SHORT_PROMPT_TEXT,
         "prompt_tokens": SHORT_PROMPT_TOKENS,
         "gen_len": 10,
     },
     {
-        "id": "long_long",
-        "name": "Long Prompt, Long Gen",
+        "id": "short_long",
+        "name": "Short Prompt, Long Gen",
+        "focus": "Decode dominante, cache KV crescendo",
+        "prompt_text": SHORT_PROMPT_TEXT,
+        "prompt_tokens": SHORT_PROMPT_TOKENS,
+        "gen_len": 20,
+    },
+    {
+        "id": "long_short",
+        "name": "Long Prompt, Short Gen",
+        "focus": "Prefill dominante, decode rapido",
         "prompt_text": LONG_PROMPT_TEXT,
         "prompt_tokens": LONG_PROMPT_TOKENS,
-        "gen_len": 50,
+        "gen_len": 10,
+    },
+    {
+        "id": "long_long",
+        "name": "Long Prompt, Long Gen",
+        "focus": "Prefill longo + decode pesado, pressao maxima de memoria",
+        "prompt_text": LONG_PROMPT_TEXT,
+        "prompt_tokens": LONG_PROMPT_TOKENS,
+        "gen_len": 20,
     },
 ]
 
@@ -241,31 +263,27 @@ COMPILATIONS = [
 ]
 
 # ============================================================================
-# Eventos de PMU — ESTRATÉGIA SEM MULTIPLEXAÇÃO
-# 
-# O i5-7400 tem 4 contadores de propósito geral + 2 fixos (cycles, instructions).
-# Para evitar multiplexação, NUNCA colocar mais de 4 eventos no mesmo grupo.
-# 
-# Estratégia:
-#   1. Grupo principal: cycles, instructions, branches, cache-misses (4 eventos)
-#   2. Branch miss + cache-refs: execução separada (3 eventos)
-#   3. L1 misses: execução separada (2 eventos)
-#   4. IPL: execução separada (2 eventos)
+# Eventos de PMU -- ESTRATEGIA SEM MULTIPLEXACAO
+#
+# O i5-7400 tem 4 contadores programaveis + 2 fixos (cycles, instructions).
+# Grupo unico com 5 eventos: cycles (fixo), instructions (fixo),
+# branches, branch-misses, L1-dcache-loads (3 dos 4 programaveis).
+# Resultado: zero multiplexacao, uma unica execucao por cenario.
+#
+# Analise de cache (L1/L2/L3/RAM) vem exclusivamente do perf mem (PEBS).
 # ============================================================================
 
-# Grupos de eventos AMD Zen 3+ (cada grupo executado separadamente, SEM multiplexação)
-# AMD não usa L1-dcache-loads como nome genérico; usa eventos nativos.
-PERF_GROUPS = {
-    "main":   ["cycles", "instructions", "cache-references", "cache-misses"],
-    "branch": ["branches", "branch-misses"],
-    "l1":     ["ls_dc_accesses", "ls_refills_from_sys.ls_mabresp_lcl_l2"],
-    "dram":   ["ls_refills_from_sys.ls_mabresp_lcl_dram",
-               "ls_refills_from_sys.ls_mabresp_rmt_dram"],
-    "l2":     ["l2_cache_req_stat.ls_rd_blk_c", "l2_pf_miss_l2_l3"],
-}
+PERF_EVENTS = [
+    "cycles",
+    "instructions",
+    "branches",
+    "branch-misses",
+    "L1-dcache-loads",
+]
 
-# Para compatibilidade com código antigo
-PERF_EVENTS_GROUP = ["cycles", "instructions", "cache-references", "cache-misses"]
+# Latencia ideal de L1 no i5-7400 (ciclos)
+L1_IDEAL_LATENCY_CYCLES = 4
+CPU_BASE_CLOCK_GHZ      = 3.0
 
 
 # ============================================================================
@@ -320,7 +338,7 @@ def check_required_files() -> bool:
     if missing:
         print("\n[ERRO] Arquivos ausentes:")
         for m in missing:
-            print(f"  ✗  {m}")
+            print(f"  AUSENTE: {m}")
         return False
 
     print(f"[OK] Todos os arquivos necessários foram encontrados. "
@@ -399,118 +417,116 @@ def parse_sim_output(stdout_str: str, tok: Tokenizer) -> dict:
     return results
 
 
-def run_perf_stat_events(binary_path: str, prompt_tokens_str: str, gen_len: int,
-                         events_list: List[str], perf_available: bool) -> Dict[str, int]:
+def run_perf_stat_single_group(binary_path: str, prompt_tokens_str: str, gen_len: int,
+                               perf_available: bool):
     """
-    Executa perf stat com lista de eventos específica.
-    Usa formato CSV (-x,) para parsing fácil.
-    Retorna dicionário com valores dos eventos.
-    
-    Cada chamada é uma execução separada do binário, mas isso é necessário
-    para garantir leitura EXATA (sem multiplexação).
+    Executa o binario sob perf stat com o grupo unico de 5 eventos.
+    Captura stdout do binario e os contadores ao mesmo tempo (uma execucao so).
+
+    Formato CSV do perf stat -x ,:
+      value , unit , event_name , run_pct , enabled_time , running_time , ...
+    O campo de evento fica no indice 2 (0-based). O valor pode ser '<not counted>'
+    se o contador nao foi suportado -- nesses casos o par e ignorado.
+
+    Retorna (stdout_str, stats_dict).
     """
-    if not perf_available:
-        return {}
-    
     env = os.environ.copy()
     env["MAX_GEN"] = str(gen_len)
     env["WEIGHTS_FILE"] = WEIGHTS_FILE
-    
-    events_str = ",".join(events_list)
+
+    if not perf_available:
+        process = subprocess.run(
+            [binary_path] + prompt_tokens_str.split(),
+            env=env, cwd=SHARED_DIR, capture_output=True, text=True,
+        )
+        return process.stdout, {}
+
+    events_str = ",".join(PERF_EVENTS)
     cmd = [
         "perf", "stat", "-e", events_str,
-        "-x", ",",  # formato CSV
+        "-x", ",",
         binary_path
     ] + prompt_tokens_str.split()
-    
-    result = subprocess.run(cmd, env=env, cwd=SHARED_DIR, 
-                           capture_output=True, text=True)
-    
+
+    result = subprocess.run(cmd, env=env, cwd=SHARED_DIR,
+                            capture_output=True, text=True)
+
+    # perf stat envia os contadores para stderr; stdout do binario vai para stdout
+    stdout_str = result.stdout
+
     stats = {}
     for line in result.stderr.split("\n"):
-        if not line.strip():
+        line = line.strip()
+        if not line or line.startswith("#"):
             continue
-        # Formato perf stat -x: "value,event_name,...."
+        # Formato: value,unit,event[,run%,enabled,running,...]
         parts = line.split(",")
-        if len(parts) >= 2:
-            try:
-                # Remover vírgulas internas do valor (ex: 1,234,567)
-                value_str = parts[0].replace(",", "").strip()
-                value = int(value_str)
-                event = parts[1].strip()
-                stats[event] = value
-            except (ValueError, IndexError):
-                continue
-    
-    return stats
+        if len(parts) < 3:
+            continue
+        value_raw = parts[0].strip()
+        event_name = parts[2].strip()
+        # Remover sufixo de qualificador (:u, :k, etc.) para chave limpa
+        event_key = event_name.split(":")[0].strip()
+        if not event_key:
+            continue
+        try:
+            stats[event_key] = int(value_raw)
+        except ValueError:
+            # '<not counted>' ou outro valor nao numerico -- ignora
+            continue
+
+    return stdout_str, stats
 
 
 def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
                       comp_name: str, scen_id: str, results_dir: str,
                       perf_available: bool):
     """
-    EXECUÇÃO PRINCIPAL - Agora usa perf stat com grupos separados.
+    Execucao principal. Chama run_perf_stat_single_group que executa o
+    binario uma unica vez sob perf stat (capturando stdout e contadores
+    simultaneamente). Depois executa perf record para o top 10 de funcoes.
     Retorna: (stdout_str, perf_stats dict, top_functions list)
     """
     env = os.environ.copy()
     env["MAX_GEN"] = str(gen_len)
     env["WEIGHTS_FILE"] = WEIGHTS_FILE
 
-    if not perf_available:
-        # Fallback sem perf
-        process = subprocess.run(
-            [binary_path] + prompt_tokens_str.split(),
-            env=env, cwd=SHARED_DIR, capture_output=True, text=True,
-        )
-        return process.stdout, {}, []
-
-    # --- Execução do binário (sem perf record, apenas para capturar stdout) ---
-    process = subprocess.run(
-        [binary_path] + prompt_tokens_str.split(),
-        env=env, cwd=SHARED_DIR, capture_output=True, text=True,
+    # --- Execucao sob perf stat (captura stdout + contadores em uma so vez) ---
+    stdout_str, raw_stats = run_perf_stat_single_group(
+        binary_path, prompt_tokens_str, gen_len, perf_available
     )
-    stdout_str = process.stdout
 
-    # --- Executar perf stat para cada grupo de eventos ---
-    all_stats = {}
-    for group_name, events in PERF_GROUPS.items():
-        stats = run_perf_stat_events(binary_path, prompt_tokens_str, gen_len, events, perf_available)
-        all_stats.update(stats)
-    
-    # --- Calcular métricas derivadas ---
-    cycles = all_stats.get("cycles", 0)
-    instructions = all_stats.get("instructions", 0)
-    branches = all_stats.get("branches", 0)
-    branch_misses = all_stats.get("branch-misses", 0)
-    cache_refs = all_stats.get("cache-references", 0)
-    cache_misses = all_stats.get("cache-misses", 0)
-    l1_misses = all_stats.get("L1-dcache-load-misses", 0)
-    l1_loads = all_stats.get("L1-dcache-loads", 0)
-    
+    # --- Metricas derivadas (apenas IPC, branch-miss-rate, IPL) ---
+    cycles        = raw_stats.get("cycles", 0)
+    instructions  = raw_stats.get("instructions", 0)
+    branches      = raw_stats.get("branches", 0)
+    branch_misses = raw_stats.get("branch-misses", 0)
+    l1_loads      = raw_stats.get("L1-dcache-loads", 0)
+
+    all_stats = dict(raw_stats)
+
     if cycles > 0:
         all_stats["IPC"] = round(instructions / cycles, 2)
     if branches > 0:
         all_stats["branch-miss-rate (%)"] = round((branch_misses / branches) * 100, 2)
-    if cache_refs > 0:
-        all_stats["LLC-miss-rate (%)"] = round((cache_misses / cache_refs) * 100, 2)
-        if l1_misses > 0:
-            all_stats["L1-miss-rate (%)"] = round((l1_misses / cache_refs) * 100, 2)
     if l1_loads > 0 and instructions > 0:
         all_stats["IPL"] = round(instructions / l1_loads, 2)
 
-    # --- Top 10 funções (usando perf report com --stdio) ---
+    if not perf_available:
+        return stdout_str, all_stats, []
+
+    # --- Top 10 funcoes (perf record + perf report) ---
+    # Execucao adicional necessaria apenas para sampling de simbolos.
     top_functions = []
     perf_data = os.path.join(BASE_DIR, "perf.data")
-    
-    # Precisamos de um perf record para o report, mas com poucos eventos
-    # para não multiplexar
+
     cmd_rec = [
         "perf", "record", "-q", "-e", "cycles", "-o", perf_data,
         binary_path
     ] + prompt_tokens_str.split()
-    
+
     subprocess.run(cmd_rec, env=env, cwd=SHARED_DIR, capture_output=True)
-    
+
     if os.path.exists(perf_data):
         cmd_rep = [
             "perf", "report", "-i", perf_data, "--stdio", "-n",
@@ -531,16 +547,16 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
                     if symbol_index != -1:
                         symbol = " ".join(parts[symbol_index:])
                         top_functions.append({"overhead": overhead, "symbol": symbol})
-        
+
         def overhead_value(entry):
             try:
                 return float(entry["overhead"].replace("%", "").replace(",", "."))
             except ValueError:
                 return 0.0
-        
+
         top_functions.sort(key=overhead_value, reverse=True)
         top_functions = top_functions[:10]
-        
+
         # --- perf annotate bitlinear ---
         safe_comp = comp_name.replace(" ", "_")
         annotate_file = os.path.join(
@@ -551,7 +567,7 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
         if res_ann.stdout:
             with open(annotate_file, "w", encoding="utf-8") as f:
                 f.write(res_ann.stdout)
-        
+
         try:
             os.remove(perf_data)
         except OSError:
@@ -560,15 +576,96 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
     return stdout_str, all_stats, top_functions
 
 
-# CPU base clock do i5-7400
-CPU_BASE_CLOCK_GHZ = 3.0
+# Mapeamento de palavras-chave do perf mem para nivel de cache
+_MEM_LEVEL_MAP = [
+    ("L1",   ["L1"]),
+    ("L2",   ["L2"]),
+    ("L3",   ["L3", "LLC"]),
+    ("RAM",  ["RAM", "DRAM", "Local RAM", "Remote RAM"]),
+]
+
+
+def _classify_level(level_desc: str) -> str:
+    """Classifica a descricao de nivel de memoria em L1/L2/L3/RAM/Outro."""
+    for label, keywords in _MEM_LEVEL_MAP:
+        for kw in keywords:
+            if kw.upper() in level_desc.upper():
+                return label
+    return "Outro"
+
+
+def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -> dict:
+    """
+    Constroi dicionario de analise consolidada de memoria a partir dos
+    dados do perf mem e do perf report.
+
+    Campos retornados:
+      level_distribution  -- dict {L1, L2, L3, RAM, Outro} -> % de loads
+      avg_latency_cycles  -- latencia media dos loads em ciclos
+      avg_latency_ns      -- latencia media em nanosegundos
+      mem_wait_fraction   -- (lat_media - L1_ideal) / lat_media
+      bitlinear_overhead_pct -- % de CPU consumida pela funcao bitlinear
+      time_lost_mem_pct   -- bitlinear_overhead_pct * mem_wait_fraction
+      time_effective_compute_pct -- bitlinear_overhead_pct * (1 - mem_wait_fraction)
+    """
+    analysis: dict = {
+        "level_distribution": {},
+        "avg_latency_cycles": None,
+        "avg_latency_ns": None,
+        "mem_wait_fraction": None,
+        "bitlinear_overhead_pct": None,
+        "time_lost_mem_pct": None,
+        "time_effective_compute_pct": None,
+    }
+
+    # Encontrar secao de loads
+    load_sec = next((s for s in mem_sections if s["kind"] == "loads"), None)
+    if load_sec is not None:
+        # Distribuicao por nivel
+        bucket: Dict[str, float] = {"L1": 0.0, "L2": 0.0, "L3": 0.0, "RAM": 0.0, "Outro": 0.0}
+        for lvl in load_sec.get("levels", []):
+            label = _classify_level(lvl["level"])
+            bucket[label] = round(bucket.get(label, 0.0) + lvl["overhead_pct"], 2)
+        analysis["level_distribution"] = bucket
+
+        # Latencia media
+        avg_cyc = load_sec.get("avg_latency_cycles")
+        if avg_cyc is not None:
+            analysis["avg_latency_cycles"] = avg_cyc
+            analysis["avg_latency_ns"] = round(avg_cyc / CPU_BASE_CLOCK_GHZ, 3)
+            if avg_cyc > 0:
+                frac = (avg_cyc - L1_IDEAL_LATENCY_CYCLES) / avg_cyc
+                analysis["mem_wait_fraction"] = round(max(frac, 0.0), 4)
+
+    # Percentagem de CPU da bitlinear (extraida do top 10)
+    bitlinear_pct = 0.0
+    for fn in top_functions:
+        sym = fn.get("symbol", "")
+        if "bitlinear" in sym.lower():
+            try:
+                bitlinear_pct += float(
+                    fn["overhead"].replace("%", "").replace(",", ".")
+                )
+            except ValueError:
+                pass
+    if bitlinear_pct > 0:
+        analysis["bitlinear_overhead_pct"] = round(bitlinear_pct, 2)
+        frac = analysis.get("mem_wait_fraction")
+        if frac is not None:
+            analysis["time_lost_mem_pct"] = round(bitlinear_pct * frac, 2)
+            analysis["time_effective_compute_pct"] = round(
+                bitlinear_pct * (1.0 - frac), 2
+            )
+
+    return analysis
 
 
 def run_perf_mem_latency(binary_path: str, prompt_tokens_str: str, gen_len: int,
                          comp_name: str, scen_id: str, results_dir: str,
                          perf_available: bool):
     """
-    Execução ADICIONAL do binário sob `perf mem record` (PEBS).
+    Execucao adicional do binario sob `perf mem record` (PEBS).
+    Retorna (mem_sections, raw_report_text).
     """
     if not perf_available:
         return [], ""
@@ -582,7 +679,7 @@ def run_perf_mem_latency(binary_path: str, prompt_tokens_str: str, gen_len: int,
     proc = subprocess.run(cmd_rec, env=env, cwd=SHARED_DIR, capture_output=True, text=True)
 
     if not os.path.exists(perf_mem_data):
-        print(f"    ⚠ perf mem record falhou. Stderr: {proc.stderr[:300]}")
+        print(f"    AVISO: perf mem record falhou. Stderr: {proc.stderr[:300]}")
         return [], ""
 
     cmd_rep = [
@@ -706,7 +803,7 @@ def main():
     global WEIGHTS_FILE
 
     parser = argparse.ArgumentParser(
-        description="BitNet b1.58 — Benchmark Unificado (AMD Zen 3+)",
+        description="BitNet b1.58 -- Benchmark Unificado (Intel i5-7400)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -728,17 +825,18 @@ def main():
     WEIGHTS_FILE = "weights_packed.bin" if args.version == 2 else "weights.bin"
 
     print("==================================================")
-    print(f" BitNet b1.58 — Benchmark Unificado ({VERSION})")
+    print(f" BitNet b1.58 -- Benchmark Unificado ({VERSION})")
     print("==================================================")
-    print(f"Diretório base:   {BASE_DIR}")
+    print(f"Diretorio base:   {BASE_DIR}")
     print(f"Dados (.bin):     {SHARED_DIR}")
     print(f"CPU:              {CPU_LABEL}")
     print(f"BITNET_VERSION:   {args.version}")
     print(f"WEIGHTS_FILE:     {WEIGHTS_FILE}")
-    print("\n⚠ Estratégia anti-multiplexação (AMD Zen 3+):")
-    print("  - Eventos nativos AMD (ls_dc_accesses, ls_refills_from_sys, etc.)")
-    print("  - Grupos separados, no máximo 4 eventos cada")
-    print("  - Leitura EXATA (sem multiplexação)\n")
+    print("\nEstrategia perf stat (grupo unico, sem multiplexacao):")
+    print(f"  Eventos: {', '.join(PERF_EVENTS)}")
+    print(f"  Contadores fixos: cycles, instructions")
+    print(f"  Contadores programaveis usados: 3 de 4")
+    print(f"  Analise de cache: exclusivamente via perf mem (PEBS)\n")
 
     if not check_required_files():
         sys.exit(1)
@@ -784,10 +882,10 @@ def main():
 
         if not run_compile(comp["flags"], binary_path, comp["name"], results_dir,
                            bitnet_version=args.version):
-            print(f"  ⚠ Pulando '{comp['name']}' por erro de compilação.")
+            print(f"  AVISO: Pulando '{comp['name']}' por erro de compilacao.")
             continue
 
-        print("  ✓ Compilação concluída.")
+        print("  OK: Compilacao concluida.")
 
         for sc in scenarios_to_run:
             run_idx += 1
@@ -804,12 +902,12 @@ def main():
                 comp["name"], sc["id"], results_dir, perf_available,
             )
 
-            # --- Diagnóstico: mostrar linhas de carregamento de dados ---
+            # --- Diagnostico: linhas de carregamento de dados ---
             print("  [Carregamento de dados]")
             load_lines_found = False
             for line in stdout_str.split("\n"):
                 if any(kw in line for kw in (
-                    "Carregando", "carregados", "não encontrado", "dummy", "sintéticos"
+                    "Carregando", "carregados", "nao encontrado", "dummy", "sinteticos"
                 )):
                     print(f"    {line.strip()}")
                     load_lines_found = True
@@ -817,29 +915,28 @@ def main():
                 print("    (nenhuma linha de carregamento capturada)")
 
             sim_metrics = parse_sim_output(stdout_str, tok)
-            print(f"  Saída decodificada: \"{sim_metrics['output_text']}\"")
+            print(f"  Saida decodificada: \"{sim_metrics['output_text']}\"")
 
-            print("\n  [Perf — Contadores Reconstruídos (grupos separados, SEM multiplexação)]")
+            print("\n  [Perf -- Contadores (grupo unico, SEM multiplexacao)]")
             for k, v in raw_perf_stats.items():
                 if isinstance(v, int):
                     print(f"    {k:<35}: {v:,}")
                 elif isinstance(v, float):
                     print(f"    {k:<35}: {v:.2f}")
-            print("    ✅ Todos os eventos foram lidos em grupos separados, SEM multiplexação.")
 
-            print("\n  [Perf Report - Top 10 Funções por Tempo de CPU]")
+            print("\n  [Perf Report - Top 10 Funcoes por Tempo de CPU]")
             for fn in top_fns:
                 print(f"    {fn['overhead']} | {fn['symbol']}")
 
-            # --- Latência por nível de memória ---
-            print("\n  [Perf Mem - Latência de loads/stores por nível]")
+            # --- Latencia por nivel de memoria (PEBS) ---
+            print("\n  [Perf Mem - Latencia de loads/stores por nivel (PEBS)]")
             mem_sections, _ = run_perf_mem_latency(
                 binary_path, prompt_tokens_str, sc["gen_len"],
                 comp["name"], sc["id"], results_dir, perf_available,
             )
             if mem_sections:
                 for sec in mem_sections:
-                    print(f"    [{sec['kind'].upper()}] latência média da seção: "
+                    print(f"    [{sec['kind'].upper()}] latencia media: "
                           f"{sec.get('avg_latency_ns', '?')} ns "
                           f"({sec.get('avg_latency_cycles', '?')} ciclos) "
                           f"| amostras: {sec['total_samples']:,}")
@@ -847,10 +944,30 @@ def main():
                         print(f"      {lvl['level']:<14} | {lvl['overhead_pct']:>6.2f}% "
                               f"| {lvl['samples']:,} amostras")
                     if sec["kind"] == "stores" and sec.get("avg_latency_cycles", 0) <= 1.5:
-                        print("      ⚠ Latência de stores ~1 ciclo — "
-                              "evento sem peso de latência real neste hardware.")
+                        print("      AVISO: Latencia de stores ~1 ciclo -- "
+                              "evento sem peso de latencia real neste hardware.")
             else:
-                print("    (sem dados — verificar suporte a PEBS/perf mem)")
+                print("    (sem dados -- verificar suporte a PEBS/perf mem)")
+
+            # --- Analise consolidada de memoria ---
+            memory_analysis = build_memory_analysis(mem_sections, top_fns)
+            print("\n  [Analise de Memoria -- Impacto na BitLinear]")
+            dist = memory_analysis.get("level_distribution", {})
+            if dist:
+                print("    Distribuicao de loads:")
+                for lv, pct in dist.items():
+                    print(f"      {lv:<6}: {pct:>6.2f}%")
+            if memory_analysis["avg_latency_cycles"] is not None:
+                print(f"    Latencia media loads : {memory_analysis['avg_latency_cycles']} ciclos "
+                      f"/ {memory_analysis['avg_latency_ns']} ns")
+            if memory_analysis["mem_wait_fraction"] is not None:
+                print(f"    Fracao de espera mem : {memory_analysis['mem_wait_fraction']:.4f} "
+                      f"(L1 ideal = {L1_IDEAL_LATENCY_CYCLES} ciclos)")
+            if memory_analysis["bitlinear_overhead_pct"] is not None:
+                print(f"    Overhead bitlinear   : {memory_analysis['bitlinear_overhead_pct']:.2f}% de CPU")
+                print(f"    Tempo perdido c/ mem : {memory_analysis['time_lost_mem_pct']:.2f}% de CPU total")
+                print(f"    Tempo efetivo comput : {memory_analysis['time_effective_compute_pct']:.2f}% de CPU total")
+
             print("\n" + "-" * 50)
 
             run_data = {
@@ -858,6 +975,7 @@ def main():
                 "compilation_flags": " ".join(comp["flags"]),
                 "scenario": sc["name"],
                 "scenario_id": sc["id"],
+                "scenario_focus": sc.get("focus", ""),
                 "prompt_len": len(sc["prompt_tokens"]),
                 "gen_len": sc["gen_len"],
                 "prompt_text": sc["prompt_text"],
@@ -867,6 +985,7 @@ def main():
                 "perf_stats": raw_perf_stats,
                 "top_functions": top_fns,
                 "mem_sections": mem_sections,
+                "memory_analysis": memory_analysis,
             }
             all_runs.append(run_data)
 
@@ -880,23 +999,25 @@ def main():
     txt_path = os.path.join(results_dir, "summary.txt")
     md_report = []
     md_report.append("==================================================")
-    md_report.append(f" BitNet b1.58 — Relatório de Benchmark ({VERSION})")
+    md_report.append(f" BitNet b1.58 -- Relatorio de Benchmark ({VERSION})")
     md_report.append("==================================================")
     md_report.append(f"Gerado em: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    md_report.append("## Configuração")
+    md_report.append("## Configuracao")
     md_report.append(f"  CPU:         {CPU_LABEL}")
-    md_report.append(f"  Perf:        {'Disponível' if perf_available else 'Indisponível'}")
-    md_report.append("  Estratégia:  Eventos divididos em grupos separados (SEM multiplexação)")
-    md_report.append(f"  Grupos:      {list(PERF_GROUPS.keys())}")
-    md_report.append(f"  Cenários:    {len(scenarios_to_run)}")
-    md_report.append(f"  Compilações: {len(compilations_to_run)}")
+    md_report.append(f"  Perf:        {'Disponivel' if perf_available else 'Indisponivel'}")
+    md_report.append(f"  Estrategia:  Grupo unico ({len(PERF_EVENTS)} eventos, sem multiplexacao)")
+    md_report.append(f"  Eventos:     {', '.join(PERF_EVENTS)}")
+    md_report.append(f"  Cenarios:    {len(scenarios_to_run)}")
+    md_report.append(f"  Compilacoes: {len(compilations_to_run)}")
     md_report.append("")
 
     for run in all_runs:
         md_report.append("=" * 50)
         md_report.append(f"### {run['compilation']} | {run['scenario']} ({run['scenario_id']})")
         md_report.append("=" * 50)
-        md_report.append(f"- Flags de compilação: {run['compilation_flags']}")
+        if run.get("scenario_focus"):
+            md_report.append(f"- Foco do cenario:     {run['scenario_focus']}")
+        md_report.append(f"- Flags de compilacao: {run['compilation_flags']}")
         md_report.append(f"- Tokens de prompt:    {run['prompt_len']} (exato) | Tokens gerados: {run['gen_len']}")
         md_report.append(f"- IDs dos tokens:      {run['prompt_tokens']}")
         md_report.append(f"- Prompt:              \"{run['prompt_text']}\"")
@@ -914,7 +1035,7 @@ def main():
         md_report.append("")
 
         if perf_available:
-            md_report.append("#### Perf — Contadores Reconstruídos (SEM multiplexação)")
+            md_report.append("#### Perf -- Contadores (grupo unico, SEM multiplexacao)")
             md_report.append("  Evento                                | Valor")
             md_report.append("  " + "-" * 38 + "|" + "-" * 20)
             for k, v in run["perf_stats"].items():
@@ -924,28 +1045,28 @@ def main():
                     md_report.append(f"  {k:<38} | {v:.2f}")
             md_report.append("")
 
-            md_report.append("#### Perf — Top 10 Funções por Tempo de CPU")
-            md_report.append("  Overhead   | Símbolo")
+            md_report.append("#### Perf -- Top 10 Funcoes por Tempo de CPU")
+            md_report.append("  Overhead   | Simbolo")
             md_report.append("  " + "-" * 12 + "|" + "-" * 40)
             for fn in run["top_functions"]:
                 md_report.append(f"  {fn['overhead']:<10} | {fn['symbol']}")
             md_report.append("")
 
-            md_report.append("#### Perf Mem — Latência de loads/stores por nível (PEBS)")
+            md_report.append("#### Perf Mem -- Latencia de loads/stores por nivel (PEBS)")
             if run.get("mem_sections"):
                 for sec in run["mem_sections"]:
                     md_report.append(
-                        f"  [{sec['kind'].upper()}] latência média da seção: "
+                        f"  [{sec['kind'].upper()}] latencia media: "
                         f"{sec.get('avg_latency_ns', '?')} ns "
                         f"({sec.get('avg_latency_cycles', '?')} ciclos) | "
                         f"amostras totais: {sec['total_samples']:,}"
                     )
                     if sec["kind"] == "stores" and sec.get("avg_latency_cycles", 0) <= 1.5:
                         md_report.append(
-                            "  ⚠ Latência de stores ~1 ciclo — "
-                            "evento sem peso de latência real neste hardware."
+                            "  AVISO: Latencia de stores ~1 ciclo -- "
+                            "evento sem peso de latencia real neste hardware."
                         )
-                    md_report.append("  Nível          | % amostras | nº amostras")
+                    md_report.append("  Nivel          | % amostras | num amostras")
                     md_report.append("  " + "-" * 15 + "|" + "-" * 12 + "|" + "-" * 14)
                     for lvl in sec["levels"]:
                         md_report.append(
@@ -953,7 +1074,41 @@ def main():
                         )
                     md_report.append("")
             else:
-                md_report.append("  (sem dados nesta execução)")
+                md_report.append("  (sem dados nesta execucao)")
+            md_report.append("")
+
+            md_report.append("#### Analise de Memoria -- Impacto na BitLinear")
+            ma = run.get("memory_analysis", {})
+            dist = ma.get("level_distribution", {})
+            if dist:
+                md_report.append("  Distribuicao de loads por nivel:")
+                md_report.append("  Nivel  | % loads")
+                md_report.append("  " + "-" * 8 + "|" + "-" * 10)
+                for lv, pct in dist.items():
+                    md_report.append(f"  {lv:<6} | {pct:>8.2f}%")
+                md_report.append("")
+            if ma.get("avg_latency_cycles") is not None:
+                md_report.append(
+                    f"  Latencia media loads : {ma['avg_latency_cycles']} ciclos "
+                    f"/ {ma['avg_latency_ns']} ns"
+                )
+            if ma.get("mem_wait_fraction") is not None:
+                md_report.append(
+                    f"  Fracao de espera mem : {ma['mem_wait_fraction']:.4f} "
+                    f"(L1 ideal = {L1_IDEAL_LATENCY_CYCLES} ciclos)"
+                )
+            if ma.get("bitlinear_overhead_pct") is not None:
+                md_report.append(
+                    f"  Overhead bitlinear   : {ma['bitlinear_overhead_pct']:.2f}% de CPU"
+                )
+                md_report.append(
+                    f"  Tempo perdido c/ mem : {ma['time_lost_mem_pct']:.2f}% de CPU total"
+                )
+                md_report.append(
+                    f"  Tempo efetivo comput : {ma['time_effective_compute_pct']:.2f}% de CPU total"
+                )
+            if not dist and ma.get("avg_latency_cycles") is None:
+                md_report.append("  (sem dados de memoria nesta execucao)")
             md_report.append("")
 
     report_text = "\n".join(md_report)
@@ -963,10 +1118,10 @@ def main():
     for fpath in [txt_path, results_dir]:
         restore_ownership(fpath)
 
-    print(f"Relatório texto salvo em:    {txt_path}")
+    print(f"Relatorio texto salvo em:    {txt_path}")
     print(f"Log completo salvo em:       {log_path}")
     print("\n==================================================")
-    print(" Benchmark concluído com sucesso!")
+    print(" Benchmark concluido com sucesso!")
     print("==================================================")
 
     tee.close()
