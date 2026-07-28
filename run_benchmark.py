@@ -21,6 +21,7 @@ import sys
 import subprocess
 import argparse
 import time
+import re
 from pathlib import Path
 from logging import getLogger
 from typing import (
@@ -589,20 +590,25 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
 
 # Mapeamento de palavras-chave do perf mem para nivel de cache
 _MEM_LEVEL_MAP = [
-    ("L1",   ["L1"]),
-    ("L2",   ["L2"]),
-    ("L3",   ["L3", "LLC"]),
-    ("RAM",  ["RAM", "DRAM", "Local RAM", "Remote RAM"]),
+    ("LFB/MAB hit", ["LFB", "LINE FILL", "MAB", "MISS ADDRESS BUFFER"]),
+    ("L1 hit",      ["L1 HIT", "L1"]),
+    ("L2 hit",      ["L2 HIT", "L2"]),
+    ("L3 hit",      ["L3 HIT", "LLC HIT", "L3", "LLC"]),
+    ("RAM",         ["LOCAL RAM", "REMOTE RAM", "DRAM", "RAM"]),
+    ("MMIO/IO",     ["I/O", "MMIO", "UNCACHED"]),
 ]
 
 
 def _classify_level(level_desc: str) -> str:
-    """Classifica a descricao de nivel de memoria em L1/L2/L3/RAM/Outro."""
+    """Classifica a descricao de nivel de memoria em L1 hit, LFB/MAB hit, L2 hit, L3 hit, RAM, MMIO/IO ou Unknown."""
+    desc_upper = level_desc.upper()
     for label, keywords in _MEM_LEVEL_MAP:
         for kw in keywords:
-            if kw.upper() in level_desc.upper():
+            if kw in desc_upper:
                 return label
-    return "Outro"
+        if label == "MMIO/IO" and re.search(r'\bIO\b', desc_upper):
+            return label
+    return "Unknown"
 
 
 def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -> dict:
@@ -611,7 +617,7 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -
     dados do perf mem e do perf report.
 
     Campos retornados:
-      level_distribution  -- dict {L1, L2, L3, RAM, Outro} -> % de loads
+      level_distribution  -- dict {L1 hit, LFB/MAB hit, L2 hit, L3 hit, RAM, MMIO/IO, Unknown} -> % de loads
       avg_latency_cycles  -- latencia media dos loads em ciclos
       avg_latency_ns      -- latencia media em nanosegundos
       mem_wait_fraction   -- (lat_media - L1_ideal) / lat_media
@@ -633,7 +639,15 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -
     load_sec = next((s for s in mem_sections if s["kind"] == "loads"), None)
     if load_sec is not None:
         # Distribuicao por nivel
-        bucket: Dict[str, float] = {"L1": 0.0, "L2": 0.0, "L3": 0.0, "RAM": 0.0, "Outro": 0.0}
+        bucket: Dict[str, float] = {
+            "L1 hit": 0.0,
+            "LFB/MAB hit": 0.0,
+            "L2 hit": 0.0,
+            "L3 hit": 0.0,
+            "RAM": 0.0,
+            "MMIO/IO": 0.0,
+            "Unknown": 0.0,
+        }
         for lvl in load_sec.get("levels", []):
             label = _classify_level(lvl["level"])
             bucket[label] = round(bucket.get(label, 0.0) + lvl["overhead_pct"], 2)
@@ -967,7 +981,7 @@ def main():
             if dist:
                 print("    Distribuicao de loads:")
                 for lv, pct in dist.items():
-                    print(f"      {lv:<6}: {pct:>6.2f}%")
+                    print(f"      {lv:<12}: {pct:>6.2f}%")
             if memory_analysis["avg_latency_cycles"] is not None:
                 print(f"    Latencia media loads : {memory_analysis['avg_latency_cycles']} ciclos "
                       f"/ {memory_analysis['avg_latency_ns']} ns")
@@ -1093,10 +1107,10 @@ def main():
             dist = ma.get("level_distribution", {})
             if dist:
                 md_report.append("  Distribuicao de loads por nivel:")
-                md_report.append("  Nivel  | % loads")
-                md_report.append("  " + "-" * 8 + "|" + "-" * 10)
+                md_report.append("  Nivel          | % loads")
+                md_report.append("  " + "-" * 15 + "|" + "-" * 10)
                 for lv, pct in dist.items():
-                    md_report.append(f"  {lv:<6} | {pct:>8.2f}%")
+                    md_report.append(f"  {lv:<14} | {pct:>8.2f}%")
                 md_report.append("")
             if ma.get("avg_latency_cycles") is not None:
                 md_report.append(
