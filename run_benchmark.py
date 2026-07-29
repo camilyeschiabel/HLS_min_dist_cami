@@ -574,18 +574,20 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
         annotate_file = os.path.join(
             results_dir, f"bitlinear_assembly_{safe_comp}_{scen_id}.txt"
         )
-        cmd_ann = ["perf", "annotate", "bitlinear", "-i", perf_data, "--stdio"]
+        cmd_ann = ["perf", "annotate", "bitlinear", "-i", perf_data, "--stdio", "--x86-asm-syntax=att"]
         res_ann = subprocess.run(cmd_ann, capture_output=True, text=True)
+        annotate_data = {}
         if res_ann.stdout:
             with open(annotate_file, "w", encoding="utf-8") as f:
                 f.write(res_ann.stdout)
+            annotate_data = parse_perf_annotate(annotate_file)
 
         try:
             os.remove(perf_data)
         except OSError:
             pass
 
-    return stdout_str, all_stats, top_functions
+    return stdout_str, all_stats, top_functions, annotate_data
 
 
 # Mapeamento de palavras-chave do perf mem para nivel de cache
@@ -611,19 +613,159 @@ def _classify_level(level_desc: str) -> str:
     return "Unknown"
 
 
-def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -> dict:
+def split_att_operands(ops_str: str) -> list:
+    """Divide os operandos AT&T ignorando vírgulas dentro de parênteses (...)."""
+    operands = []
+    current = []
+    in_paren = False
+    for char in ops_str:
+        if char == '(':
+            in_paren = True
+            current.append(char)
+        elif char == ')':
+            in_paren = False
+            current.append(char)
+        elif char == ',' and not in_paren:
+            operands.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    if current:
+        operands.append(''.join(current).strip())
+    return operands
+
+
+def classify_instruction(opcode: str, operands: str) -> str:
+    """Classifica uma instrução assembly x86 (AT&T syntax) em LOAD, STORE, COMPUTE ou CONTROL."""
+    op = opcode.lower().strip()
+    ops = operands.strip()
+
+    # Opcodes de controle de fluxo, instrução de pilha e saltos
+    control_opcodes = {
+        "jmp", "je", "jne", "jg", "jge", "jl", "jle", "ja", "jae", "jb", "jbe",
+        "js", "jns", "jz", "jnz", "call", "ret", "retq", "cmp", "test", "push", "pop",
+        "nop", "ud2", "endbr64", "leave"
+    }
+
+    base_op = op
+    if op.startswith("j") or op.startswith("cmp") or op.startswith("test"):
+        if op not in control_opcodes and len(op) > 3 and op[:-1] in control_opcodes:
+            base_op = op[:-1]
+
+    if base_op in control_opcodes:
+        return "CONTROL"
+
+    # lea apenas calcula endereços, não acessa memória
+    if op in ("lea", "leaq", "leal", "leaw"):
+        return "COMPUTE"
+
+    # Instruções explícitas de broadcast / load vetorial
+    if op.startswith("vpbroadcast") or op.startswith("vbroadcast") or op == "vmovntdqa":
+        return "LOAD"
+
+    parsed_ops = split_att_operands(ops)
+
+    if not parsed_ops:
+        return "COMPUTE"
+
+    # Verificar se algum operando acessa memória (...)
+    mem_indices = [i for i, o in enumerate(parsed_ops) if "(" in o and ")" in o]
+
+    if mem_indices:
+        # Se o último operando (destino) for memória -> STORE
+        if mem_indices[-1] == len(parsed_ops) - 1 and len(parsed_ops) > 1:
+            return "STORE"
+        else:
+            return "LOAD"
+
+    return "COMPUTE"
+
+
+def parse_perf_annotate(annotate_file_path: str) -> dict:
+    """
+    Lê o arquivo gerado pelo perf annotate e categoriza o tempo de CPU
+    nas instruções da função bitlinear (LOAD, STORE, COMPUTE, CONTROL).
+    """
+    result = {
+        "total_annotated_pct": 0.0,
+        "load_pct": 0.0,
+        "store_pct": 0.0,
+        "compute_pct": 0.0,
+        "control_pct": 0.0,
+        "load_ratio": 0.0,
+        "store_ratio": 0.0,
+        "compute_ratio": 0.0,
+        "control_ratio": 0.0,
+        "top_instructions": [],
+    }
+
+    if not os.path.isfile(annotate_file_path):
+        return result
+
+    try:
+        with open(annotate_file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception:
+        return result
+
+    # Regex para extrair a porcentagem e a instrução
+    # Exemplo: "  25.43 :   401280:   vmovdqu (%rsi,%rax,1),%ymm1"
+    pattern = re.compile(
+        r"^\s*([0-9]+[.,][0-9]+)\s*:\s*(?:[0-9a-fA-F]+:\s*)?([a-zA-Z0-9._]+)\s*(.*)$"
+    )
+
+    cat_totals = {"LOAD": 0.0, "STORE": 0.0, "COMPUTE": 0.0, "CONTROL": 0.0}
+    top_insts = []
+
+    for line in lines:
+        line_clean = line.strip()
+        match = pattern.match(line_clean)
+        if not match:
+            continue
+
+        pct_str, opcode, operands = match.groups()
+        try:
+            pct = float(pct_str.replace(",", "."))
+        except ValueError:
+            continue
+
+        if pct <= 0.0:
+            continue
+
+        operands_clean = operands.split("#")[0].strip()
+        category = classify_instruction(opcode, operands_clean)
+        cat_totals[category] += pct
+        top_insts.append({
+            "pct": round(pct, 2),
+            "opcode": opcode,
+            "operands": operands_clean,
+            "category": category,
+        })
+
+    total = sum(cat_totals.values())
+    result["total_annotated_pct"] = round(total, 2)
+    result["load_pct"] = round(cat_totals["LOAD"], 2)
+    result["store_pct"] = round(cat_totals["STORE"], 2)
+    result["compute_pct"] = round(cat_totals["COMPUTE"], 2)
+    result["control_pct"] = round(cat_totals["CONTROL"], 2)
+
+    if total > 0:
+        result["load_ratio"] = round(cat_totals["LOAD"] / total, 4)
+        result["store_ratio"] = round(cat_totals["STORE"] / total, 4)
+        result["compute_ratio"] = round(cat_totals["COMPUTE"] / total, 4)
+        result["control_ratio"] = round(cat_totals["CONTROL"] / total, 4)
+
+    top_insts.sort(key=lambda x: x["pct"], reverse=True)
+    result["top_instructions"] = top_insts[:10]
+
+    return result
+
+
+def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
+                          annotate_data: dict = None) -> dict:
     """
     Constroi dicionario de analise consolidada de memoria a partir dos
-    dados do perf mem e do perf report.
-
-    Campos retornados:
-      level_distribution  -- dict {L1 hit, LFB/MAB hit, L2 hit, L3 hit, RAM, MMIO/IO, Unknown} -> % de loads
-      avg_latency_cycles  -- latencia media dos loads em ciclos
-      avg_latency_ns      -- latencia media em nanosegundos
-      mem_wait_fraction   -- (lat_media - L1_ideal) / lat_media
-      bitlinear_overhead_pct -- % de CPU consumida pela funcao bitlinear
-      time_lost_mem_pct   -- bitlinear_overhead_pct * mem_wait_fraction
-      time_effective_compute_pct -- bitlinear_overhead_pct * (1 - mem_wait_fraction)
+    dados do perf mem, perf report e perf annotate.
     """
     analysis: dict = {
         "level_distribution": {},
@@ -631,6 +773,8 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -
         "avg_latency_ns": None,
         "mem_wait_fraction": None,
         "bitlinear_overhead_pct": None,
+        "annotate": annotate_data or {},
+        "bitlinear_load_cpu_pct": None,
         "time_lost_mem_pct": None,
         "time_effective_compute_pct": None,
     }
@@ -676,7 +820,20 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict]) -
     if bitlinear_pct > 0:
         analysis["bitlinear_overhead_pct"] = round(bitlinear_pct, 2)
         frac = analysis.get("mem_wait_fraction")
-        if frac is not None:
+
+        ann = annotate_data or {}
+        load_ratio = ann.get("load_ratio")
+
+        if load_ratio is not None and ann.get("total_annotated_pct", 0) > 0:
+            load_cpu_pct = bitlinear_pct * load_ratio
+            analysis["bitlinear_load_cpu_pct"] = round(load_cpu_pct, 2)
+            if frac is not None:
+                lost_mem = load_cpu_pct * frac
+                analysis["time_lost_mem_pct"] = round(lost_mem, 2)
+                analysis["time_effective_compute_pct"] = round(bitlinear_pct - lost_mem, 2)
+            else:
+                analysis["time_effective_compute_pct"] = round(bitlinear_pct, 2)
+        elif frac is not None:
             analysis["time_lost_mem_pct"] = round(bitlinear_pct * frac, 2)
             analysis["time_effective_compute_pct"] = round(
                 bitlinear_pct * (1.0 - frac), 2
@@ -707,12 +864,22 @@ def run_perf_mem_latency(binary_path: str, prompt_tokens_str: str, gen_len: int,
         print(f"    AVISO: perf mem record falhou. Stderr: {proc.stderr[:300]}")
         return [], ""
 
+    # Tenta filtrar especificamente pela funcao bitlinear
     cmd_rep = [
         "perf", "mem", "report", "-i", perf_mem_data, "--stdio", "-n",
-        "--sort=mem",
+        "--symbol=bitlinear", "--sort=mem",
     ]
     res_rep = subprocess.run(cmd_rep, capture_output=True, text=True)
     raw_report_text = res_rep.stdout
+
+    # Fallback se a filtragem por simbolo nao retornar amostras
+    if "# Samples: 0" in raw_report_text or "Samples:" not in raw_report_text:
+        cmd_rep_fallback = [
+            "perf", "mem", "report", "-i", perf_mem_data, "--stdio", "-n",
+            "--sort=mem",
+        ]
+        res_rep = subprocess.run(cmd_rep_fallback, capture_output=True, text=True)
+        raw_report_text = res_rep.stdout
 
     safe_comp = comp_name.replace(" ", "_")
     raw_path = os.path.join(results_dir, f"mem_latency_raw_{safe_comp}_{scen_id}.txt")
@@ -922,7 +1089,7 @@ def main():
             prompt_tokens_str = " ".join(str(tid) for tid in sc["prompt_tokens"])
             print(f"  Tokens de prompt: {len(sc['prompt_tokens'])} (exato)")
 
-            stdout_str, raw_perf_stats, top_fns = run_perf_combined(
+            stdout_str, raw_perf_stats, top_fns, annotate_data = run_perf_combined(
                 binary_path, prompt_tokens_str, sc["gen_len"],
                 comp["name"], sc["id"], results_dir, perf_available,
             )
@@ -975,11 +1142,18 @@ def main():
                 print("    (sem dados -- verificar suporte a PEBS/perf mem)")
 
             # --- Analise consolidada de memoria ---
-            memory_analysis = build_memory_analysis(mem_sections, top_fns)
+            memory_analysis = build_memory_analysis(mem_sections, top_fns, annotate_data)
             print("\n  [Analise de Memoria -- Impacto na BitLinear]")
+            ann = memory_analysis.get("annotate", {})
+            if ann and ann.get("total_annotated_pct", 0) > 0:
+                print("    Distribuicao de Instrucoes na BitLinear (perf annotate):")
+                print(f"      LOAD (leituras memoria)  : {ann.get('load_pct', 0):>6.2f}% ({ann.get('load_ratio', 0)*100:.1f}% das instrs)")
+                print(f"      COMPUTE (SIMD/ALU)       : {ann.get('compute_pct', 0):>6.2f}% ({ann.get('compute_ratio', 0)*100:.1f}% das instrs)")
+                print(f"      STORE (escritas memoria) : {ann.get('store_pct', 0):>6.2f}% ({ann.get('store_ratio', 0)*100:.1f}% das instrs)")
+                print(f"      CONTROL (branches/loop)  : {ann.get('control_pct', 0):>6.2f}% ({ann.get('control_ratio', 0)*100:.1f}% das instrs)")
             dist = memory_analysis.get("level_distribution", {})
             if dist:
-                print("    Distribuicao de loads:")
+                print("    Distribuicao de loads por nivel:")
                 for lv, pct in dist.items():
                     print(f"      {lv:<12}: {pct:>6.2f}%")
             if memory_analysis["avg_latency_cycles"] is not None:
@@ -989,9 +1163,13 @@ def main():
                 print(f"    Fracao de espera mem : {memory_analysis['mem_wait_fraction']:.4f} "
                       f"(L1 ideal = {L1_IDEAL_LATENCY_CYCLES} ciclos)")
             if memory_analysis["bitlinear_overhead_pct"] is not None:
-                print(f"    Overhead bitlinear   : {memory_analysis['bitlinear_overhead_pct']:.2f}% de CPU")
-                print(f"    Tempo perdido c/ mem : {memory_analysis['time_lost_mem_pct']:.2f}% de CPU total")
-                print(f"    Tempo efetivo comput : {memory_analysis['time_effective_compute_pct']:.2f}% de CPU total")
+                print(f"    Overhead bitlinear   : {memory_analysis['bitlinear_overhead_pct']:.2f}% de CPU total")
+                if memory_analysis.get("bitlinear_load_cpu_pct") is not None:
+                    print(f"    Tempo c/ instrs LOAD : {memory_analysis['bitlinear_load_cpu_pct']:.2f}% de CPU total")
+                if memory_analysis.get("time_lost_mem_pct") is not None:
+                    print(f"    Tempo perdido c/ mem : {memory_analysis['time_lost_mem_pct']:.2f}% de CPU total (stall de LOAD)")
+                if memory_analysis.get("time_effective_compute_pct") is not None:
+                    print(f"    Tempo efetivo comput : {memory_analysis['time_effective_compute_pct']:.2f}% de CPU total (SIMD + exec ativa)")
 
             print("\n" + "-" * 50)
 
@@ -1104,6 +1282,24 @@ def main():
 
             md_report.append("#### Analise de Memoria -- Impacto na BitLinear")
             ma = run.get("memory_analysis", {})
+            ann = ma.get("annotate", {})
+            if ann and ann.get("total_annotated_pct", 0) > 0:
+                md_report.append("  Distribuicao de Instrucoes na BitLinear (perf annotate):")
+                md_report.append("  Categoria      | % BitLinear | % Instrucoes")
+                md_report.append("  " + "-" * 15 + "|" + "-" * 13 + "|" + "-" * 14)
+                md_report.append(f"  LOAD (leituras)| {ann.get('load_pct', 0):>11.2f}% | {ann.get('load_ratio', 0)*100:>12.1f}%")
+                md_report.append(f"  COMPUTE (SIMD) | {ann.get('compute_pct', 0):>11.2f}% | {ann.get('compute_ratio', 0)*100:>12.1f}%")
+                md_report.append(f"  STORE (escrit) | {ann.get('store_pct', 0):>11.2f}% | {ann.get('store_ratio', 0)*100:>12.1f}%")
+                md_report.append(f"  CONTROL(branch)| {ann.get('control_pct', 0):>11.2f}% | {ann.get('control_ratio', 0)*100:>12.1f}%")
+                md_report.append("")
+                if ann.get("top_instructions"):
+                    md_report.append("  Top Instrucoes Assembly Annotate:")
+                    md_report.append("    Overhead % | Categoria | Instrucao")
+                    md_report.append("    " + "-" * 11 + "|" + "-" * 11 + "|" + "-" * 30)
+                    for inst in ann["top_instructions"]:
+                        md_report.append(f"    {inst['pct']:>9.2f}% | {inst['category']:<9} | {inst['opcode']} {inst['operands']}")
+                    md_report.append("")
+
             dist = ma.get("level_distribution", {})
             if dist:
                 md_report.append("  Distribuicao de loads por nivel:")
@@ -1126,12 +1322,18 @@ def main():
                 md_report.append(
                     f"  Overhead bitlinear   : {ma['bitlinear_overhead_pct']:.2f}% de CPU"
                 )
-                md_report.append(
-                    f"  Tempo perdido c/ mem : {ma['time_lost_mem_pct']:.2f}% de CPU total"
-                )
-                md_report.append(
-                    f"  Tempo efetivo comput : {ma['time_effective_compute_pct']:.2f}% de CPU total"
-                )
+                if ma.get("bitlinear_load_cpu_pct") is not None:
+                    md_report.append(
+                        f"  Tempo c/ instrs LOAD : {ma['bitlinear_load_cpu_pct']:.2f}% de CPU total"
+                    )
+                if ma.get("time_lost_mem_pct") is not None:
+                    md_report.append(
+                        f"  Tempo perdido c/ mem : {ma['time_lost_mem_pct']:.2f}% de CPU total (stall de LOAD)"
+                    )
+                if ma.get("time_effective_compute_pct") is not None:
+                    md_report.append(
+                        f"  Tempo efetivo comput : {ma['time_effective_compute_pct']:.2f}% de CPU total (SIMD + exec ativa)"
+                    )
             if not dist and ma.get("avg_latency_cycles") is None:
                 md_report.append("  (sem dados de memoria nesta execucao)")
             md_report.append("")
