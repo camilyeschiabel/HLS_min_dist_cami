@@ -296,9 +296,7 @@ PERF_EVENTS = [
     "cpu-clock",       # evento de software: tempo de CPU em ns (calcula avg_clock_ghz)
 ]
 
-# Latencia ideal de L1 no i5-7400 (ciclos)
-L1_IDEAL_LATENCY_CYCLES = 4
-CPU_BASE_CLOCK_GHZ      = 3.0
+CPU_BASE_CLOCK_GHZ = 3.0   # fallback quando avg_clock_ghz nao estiver disponivel
 
 
 # ============================================================================
@@ -533,7 +531,7 @@ def run_perf_combined(binary_path: str, prompt_tokens_str: str, gen_len: int,
         all_stats["avg_clock_ghz"] = round(cycles / cpu_clock_ns, 4)
 
     if not perf_available:
-        return stdout_str, all_stats, []
+        return stdout_str, all_stats, [], {}
 
     # --- Top 10 funcoes (perf record + perf report) ---
     # Execucao adicional necessaria apenas para sampling de simbolos.
@@ -691,9 +689,20 @@ def classify_instruction(opcode: str, operands: str) -> str:
 
 def parse_perf_annotate(annotate_file_path: str) -> dict:
     """
-    Lê o arquivo gerado pelo perf annotate e categoriza o tempo de CPU
-    nas instruções da função bitlinear (LOAD, STORE, COMPUTE, CONTROL).
-    Estima também o número de instruções de LOAD executadas.
+    Lê o arquivo gerado pelo perf annotate e conta todas as instruções
+    de LOAD presentes no corpo da função bitlinear, percorrendo a saída
+    completa do perf annotate — independentemente do percentual de overhead.
+
+    Cada linha de assembly com opcode é uma instrução estática do loop.
+    n_loop_loads representa o número de instruções de LOAD distintas no corpo
+    da função (loop principal incluído), não as de maior overhead.
+
+    Essa contagem é usada em build_memory_analysis para calcular:
+        Nloads = n_loop_loads × bitlinear_elements
+    onde bitlinear_elements é a contagem real de (in_features × out_features)
+    acumulada pela instrumentação do profiler C durante toda a inferência.
+
+    O Top-10 (top_instructions) é mantido apenas para exibição no relatório.
     """
     result = {
         "total_annotated_pct": 0.0,
@@ -706,8 +715,10 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
         "compute_ratio": 0.0,
         "control_ratio": 0.0,
         "top_instructions": [],
-        "estimated_loads_per_elem": None,
         "n_loop_loads": 0,
+        # loads_per_elem é deliberadamente removido: a relação entre LOADs e
+        # elementos é N_loads = n_loop_loads × elements, não elements × ratio.
+        # Ver build_memory_analysis para o cálculo correto de Nloads.
     }
 
     if not os.path.isfile(annotate_file_path):
@@ -719,12 +730,17 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
     except Exception:
         return result
 
+    # Padrão que reconhece linhas de assembly do perf annotate.
+    # Formato esperado (com ou sem percentual de overhead):
+    #   "  12.34 :  4a1b3c:  vmovss   (%rsi,%rax,4),%xmm0"
+    #   "         :  4a1b3d:  add      %eax,%ecx"
     pattern = re.compile(
-        r"^\s*([0-9]+[.,][0-9]+)\s*:\s*(?:[0-9a-fA-F]+:\s*)?([a-zA-Z0-9._]+)\s*(.*)$"
+        r"^\s*([0-9]+[.,][0-9]+)?\s*:\s*([0-9a-fA-F]+):\s*([a-zA-Z0-9._]+)\s*(.*)$"
     )
 
     cat_totals = {"LOAD": 0.0, "STORE": 0.0, "COMPUTE": 0.0, "CONTROL": 0.0}
     top_insts = []
+    n_loop_loads = 0
 
     for line in lines:
         line_clean = line.strip()
@@ -732,24 +748,35 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
         if not match:
             continue
 
-        pct_str, opcode, operands = match.groups()
-        try:
-            pct = float(pct_str.replace(",", "."))
-        except ValueError:
-            continue
+        pct_str, _addr, opcode, operands = match.groups()
 
-        if pct <= 0.0:
-            continue
+        pct = 0.0
+        if pct_str:
+            try:
+                pct = float(pct_str.replace(",", "."))
+            except ValueError:
+                pct = 0.0
 
         operands_clean = operands.split("#")[0].strip()
         category = classify_instruction(opcode, operands_clean)
-        cat_totals[category] += pct
-        top_insts.append({
-            "pct": round(pct, 2),
-            "opcode": opcode,
-            "operands": operands_clean,
-            "category": category,
-        })
+
+        # Acumula percentual de overhead para as categorias (usado no relatório)
+        if pct > 0.0:
+            cat_totals[category] += pct
+            top_insts.append({
+                "pct": round(pct, 2),
+                "opcode": opcode,
+                "operands": operands_clean,
+                "category": category,
+            })
+
+        # Conta TODAS as instruções de LOAD no corpo da função,
+        # independentemente de terem ou não percentual de overhead registrado.
+        # Cada linha de assembly representa uma instrução estática do loop;
+        # não aplicar nenhum fator SIMD aqui — isso é responsabilidade do
+        # modelo de execução, não da contagem estrutural do assembly.
+        if category == "LOAD":
+            n_loop_loads += 1
 
     total = sum(cat_totals.values())
     result["total_annotated_pct"] = round(total, 2)
@@ -764,45 +791,11 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
         result["compute_ratio"] = round(cat_totals["COMPUTE"] / total, 4)
         result["control_ratio"] = round(cat_totals["CONTROL"] / total, 4)
 
+    # Top-10: apenas para exibição no relatório; não é usado para contar LOADs.
     top_insts.sort(key=lambda x: x["pct"], reverse=True)
     result["top_instructions"] = top_insts[:10]
 
-    # --- Contagem de instruções de LOAD no perf annotate ---
-    n_loop_loads = 0
-    has_ymm = False
-    has_xmm = False
-
-    for inst in top_insts:
-        if inst["category"] == "LOAD":
-            n_loop_loads += 1
-            op_str = f"{inst['opcode']} {inst['operands']}".lower()
-            if "%ymm" in op_str:
-                has_ymm = True
-            elif "%xmm" in op_str:
-                has_xmm = True
-
-    if n_loop_loads == 0:
-        for line in lines:
-            line_clean = line.strip()
-            parts = line_clean.split()
-            if len(parts) >= 3 and ":" in line_clean:
-                for idx, p in enumerate(parts):
-                    if p.endswith(":") and idx + 1 < len(parts):
-                        opcode = parts[idx + 1]
-                        operands = " ".join(parts[idx + 2:]) if idx + 2 < len(parts) else ""
-                        cat = classify_instruction(opcode, operands)
-                        if cat == "LOAD":
-                            n_loop_loads += 1
-                            if "%ymm" in operands.lower():
-                                has_ymm = True
-                            elif "%xmm" in operands.lower():
-                                has_xmm = True
-                        break
-
-    step_size = 32.0 if has_ymm else (16.0 if has_xmm else 1.0)
-    if n_loop_loads > 0:
-        result["n_loop_loads"] = n_loop_loads
-        result["estimated_loads_per_elem"] = n_loop_loads / step_size
+    result["n_loop_loads"] = n_loop_loads
 
     return result
 
@@ -838,15 +831,28 @@ def extract_bitlinear_profiler_info(stdout_str: str) -> dict:
 def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
                            annotate_data: dict = None, total_inf_time: float = 0.0,
                            bitlinear_calls: int = 0, bitlinear_elements: int = 0,
-                           bitnet_version: int = 1, comp_name: str = "") -> dict:
+                           bitnet_version: int = 1, comp_name: str = "",
+                           perf_stats: dict = None) -> dict:
     """
-    Constroi dicionario de analise consolidada de memoria usando o modelo:
+    Constroi dicionário de análise consolidada de memória usando o modelo:
       Tbitlinear = tempo_total_inferencia × overhead_bitlinear
       Tmem = Nloads × Lmedio
       TCPU = Tbitlinear − Tmem
-    Onde Lmedio é a latência média dos loads (PEBS) e Nloads é a estimativa
-    do total de instruções de LOAD executadas pela BitLinear durante a inferência,
-    calculado dinamicamente via instrumentação (bitlinear_calls e elementos) e perf annotate.
+
+    Nloads é calculado a partir da estrutura real da função bitlinear:
+      Nloads = n_loop_loads × bitlinear_elements
+
+    onde:
+      - n_loop_loads   = número de instruções de LOAD distintas no corpo da
+                         função bitlinear, contadas percorrendo toda a saída
+                         do perf annotate (parse_perf_annotate).
+      - bitlinear_elements = soma de (in_features × out_features) de todas
+                             as chamadas à bitlinear durante a inferência,
+                             reportada pelo profiler C via g_bitlinear_elements.
+
+    Isso reflete diretamente o algoritmo: cada instrução de LOAD estática no
+    loop interno é executada uma vez por par (i, j) — exatamente o que
+    bitlinear_elements contabiliza.
     """
     analysis: dict = {
         "level_distribution": {},
@@ -855,7 +861,7 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
         "Lmedio_s": None,
         "bitlinear_overhead_pct": None,
         "Tbitlinear_s": None,
-        "loads_per_elem": None,
+        "n_load_instrs": None,
         "n_loads_per_call": None,
         "total_bitlinear_calls": None,
         "Nloads": None,
@@ -888,11 +894,14 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
         avg_cyc = load_sec.get("avg_latency_cycles")
         if avg_cyc is not None:
             analysis["avg_latency_cycles"] = avg_cyc
-            avg_ns = round(avg_cyc / CPU_BASE_CLOCK_GHZ, 3)
+            # Usa o clock médio medido pelo perf stat (cycles/cpu-clock);
+            # cai para CPU_BASE_CLOCK_GHZ se ainda não estiver calculado.
+            clk_ghz = (perf_stats or {}).get("avg_clock_ghz", CPU_BASE_CLOCK_GHZ) or CPU_BASE_CLOCK_GHZ
+            avg_ns = round(avg_cyc / clk_ghz, 3)
             analysis["avg_latency_ns"] = avg_ns
-            analysis["Lmedio_s"] = (avg_cyc / CPU_BASE_CLOCK_GHZ) * 1e-9
+            analysis["Lmedio_s"] = (avg_cyc / clk_ghz) * 1e-9
 
-    # Percentagem de CPU da bitlinear (extraida do top 10)
+    # Percentagem de CPU da bitlinear (extraida do top 10 do perf report)
     bitlinear_pct = 0.0
     for fn in top_functions:
         sym = fn.get("symbol", "")
@@ -910,32 +919,34 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
             t_bitlinear = total_inf_time * (bitlinear_pct / 100.0)
             analysis["Tbitlinear_s"] = round(t_bitlinear, 6)
 
-    # Estimativa dinâmica de Nloads a partir de instrumentação real e perf annotate
+    # --- Cálculo de Nloads baseado na estrutura real do assembly ---
+    #
+    # n_loop_loads: instruções de LOAD distintas contadas no corpo da bitlinear
+    #               pelo parse_perf_annotate, percorrendo todo o arquivo.
+    # bitlinear_elements: soma de (in_features × out_features) de todas as
+    #                     chamadas, reportada pelo profiler C (g_bitlinear_elements).
+    #
+    # Cada instrução de LOAD estática no loop interno da bitlinear executa
+    # exatamente uma vez por par (i, j), logo:
+    #   Nloads = n_loop_loads × bitlinear_elements
     ann = annotate_data or {}
-    loads_per_elem = ann.get("estimated_loads_per_elem")
-    if loads_per_elem is None or loads_per_elem <= 0:
-        comp_upper = comp_name.upper()
-        if "SIMD" in comp_upper or "ACCUMULATED" in comp_upper or "O3" in comp_upper:
-            if bitnet_version == 2:
-                loads_per_elem = 2.0 / 128.0
-            else:
-                loads_per_elem = 2.0 / 32.0
-        elif "UNROLL" in comp_upper:
-            loads_per_elem = 2.0 / 4.0
-        else:
-            loads_per_elem = 2.0
+    n_loop_loads = ann.get("n_loop_loads", 0)
 
-    if bitlinear_calls > 0 and bitlinear_elements > 0:
-        avg_elems_per_call = bitlinear_elements / float(bitlinear_calls)
-        n_loads_per_call = avg_elems_per_call * loads_per_elem
-        Nloads = int(round(n_loads_per_call * bitlinear_calls))
-    else:
-        n_loads_per_call = 0
-        Nloads = 0
-
-    analysis["loads_per_elem"] = round(loads_per_elem, 6)
-    analysis["n_loads_per_call"] = int(round(n_loads_per_call))
+    analysis["n_load_instrs"] = n_loop_loads
     analysis["total_bitlinear_calls"] = bitlinear_calls
+
+    if n_loop_loads > 0 and bitlinear_elements > 0:
+        Nloads = n_loop_loads * bitlinear_elements
+        # Loads médios por chamada (para diagnóstico)
+        avg_elems_per_call = (
+            bitlinear_elements / float(bitlinear_calls) if bitlinear_calls > 0 else 0
+        )
+        n_loads_per_call = int(round(n_loop_loads * avg_elems_per_call))
+    else:
+        Nloads = 0
+        n_loads_per_call = 0
+
+    analysis["n_loads_per_call"] = n_loads_per_call
     analysis["Nloads"] = Nloads
 
     Lmedio_s = analysis.get("Lmedio_s")
@@ -957,7 +968,7 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
 
 def run_perf_mem_latency(binary_path: str, prompt_tokens_str: str, gen_len: int,
                          comp_name: str, scen_id: str, results_dir: str,
-                         perf_available: bool):
+                         perf_available: bool, avg_clock_ghz: float = 0.0):
     """
     Execucao adicional do binario sob `perf mem record` (PEBS).
     Retorna (mem_sections, raw_report_text).
@@ -1056,7 +1067,8 @@ def run_perf_mem_latency(binary_path: str, prompt_tokens_str: str, gen_len: int,
         if sec["total_weight_cycles"] is not None and total_samples > 0:
             avg_cycles = sec["total_weight_cycles"] / total_samples
             sec["avg_latency_cycles"] = round(avg_cycles, 2)
-            sec["avg_latency_ns"] = round(avg_cycles / CPU_BASE_CLOCK_GHZ, 3)
+            clk = avg_clock_ghz if avg_clock_ghz > 0 else CPU_BASE_CLOCK_GHZ
+            sec["avg_latency_ns"] = round(avg_cycles / clk, 3)
 
     try:
         os.remove(perf_mem_data)
@@ -1238,6 +1250,7 @@ def main():
             mem_sections, _ = run_perf_mem_latency(
                 binary_path, prompt_tokens_str, sc["gen_len"],
                 comp["name"], sc["id"], results_dir, perf_available,
+                avg_clock_ghz=raw_perf_stats.get("avg_clock_ghz", 0.0),
             )
             if mem_sections:
                 for sec in mem_sections:
@@ -1263,7 +1276,8 @@ def main():
                 bitlinear_calls=prof_info["bitlinear_calls"],
                 bitlinear_elements=prof_info["bitlinear_elements"],
                 bitnet_version=args.version,
-                comp_name=comp["name"]
+                comp_name=comp["name"],
+                perf_stats=raw_perf_stats,
             )
             print("\n  [Analise de Memoria -- Impacto na BitLinear (Modelo Tbitlinear = Tmem + TCPU)]")
             ann = memory_analysis.get("annotate", {})
@@ -1281,7 +1295,10 @@ def main():
             if memory_analysis.get("avg_latency_cycles") is not None:
                 print(f"    Latencia media loads (Lmedio) : {memory_analysis['avg_latency_cycles']} ciclos / {memory_analysis['avg_latency_ns']} ns ({memory_analysis.get('Lmedio_s', 0):.9e} s)")
             if memory_analysis.get("Nloads") is not None:
-                print(f"    Nloads (estimado bitlinear)   : {memory_analysis['Nloads']:,} loads ({memory_analysis.get('n_loads_per_call', 0):,} loads/chamada | {memory_analysis.get('total_bitlinear_calls', 0):,} chamadas)")
+                print(f"    Nloads (instrs LOAD x elementos) : {memory_analysis['Nloads']:,} loads "
+                      f"({memory_analysis.get('n_load_instrs', 0)} instrs LOAD no assembly "
+                      f"x {memory_analysis.get('n_loads_per_call', 0):,} elems/chamada | "
+                      f"{memory_analysis.get('total_bitlinear_calls', 0):,} chamadas)")
             if memory_analysis.get("Tbitlinear_s") is not None:
                 print(f"    Tbitlinear (tempo bitlinear) : {memory_analysis['Tbitlinear_s']:.6f} s ({memory_analysis.get('bitlinear_overhead_pct', 0):.2f}% da inferencia)")
             if memory_analysis.get("Tmem_s") is not None:
@@ -1433,8 +1450,10 @@ def main():
                 )
             if ma.get("Nloads") is not None:
                 md_report.append(
-                    f"  Nloads (estimado bitlinear)   : {ma['Nloads']:,} loads "
-                    f"({ma.get('n_loads_per_call', 0):,} loads/chamada | {ma.get('total_bitlinear_calls', 0):,} chamadas)"
+                    f"  Nloads (instrs LOAD x elementos) : {ma['Nloads']:,} loads "
+                    f"({ma.get('n_load_instrs', 0)} instrs LOAD no assembly "
+                    f"x {ma.get('n_loads_per_call', 0):,} elems/chamada | "
+                    f"{ma.get('total_bitlinear_calls', 0):,} chamadas)"
                 )
             if ma.get("Tbitlinear_s") is not None:
                 md_report.append(
