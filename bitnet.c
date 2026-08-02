@@ -55,8 +55,17 @@ static void dump_array(const char *name, const float *data, int size) {
 }
 #endif
 
+#ifndef __SYNTHESIS__
+unsigned long long g_bitlinear_calls = 0;
+unsigned long long g_bitlinear_elements = 0;
+#endif
+
 void bitlinear(const act_t *in, const weight_t *W, act_t *out, int in_features,
                int out_features, act_t scale) {
+#ifndef __SYNTHESIS__
+  g_bitlinear_calls++;
+  g_bitlinear_elements += ((unsigned long long)in_features * (unsigned long long)out_features);
+#endif
   // 1. Activation Quantization (equivalent to s = 127 / max(abs(x)))
   float max_abs = 1e-5f;
   for (int j = 0; j < in_features; j++) {

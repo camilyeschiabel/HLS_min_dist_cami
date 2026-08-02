@@ -455,6 +455,9 @@ int main(int argc, char **argv) {
         printf("Porcentagem do tempo: %.6f%%\n",
                (total_post_process_time / total_prog_time) * 100.0);
 
+    printf("\n[PROFILER] Bitlinear calls: %llu\n", g_bitlinear_calls);
+    printf("[PROFILER] Bitlinear elements: %llu\n", g_bitlinear_elements);
+
     // Limpeza
     free(all_weights);
     free(all_norms);

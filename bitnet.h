@@ -13,6 +13,8 @@ static double dummy_lm_head_time = 0.0;
 #include <stdint.h>
 extern double total_rope_time;
 extern double total_lm_head_time;
+extern unsigned long long g_bitlinear_calls;
+extern unsigned long long g_bitlinear_elements;
 double get_time_in_seconds(void);
 #endif
 

@@ -61,9 +61,17 @@ try:
     import tiktoken
     from tiktoken.load import load_tiktoken_bpe
 except ImportError:
-    print("Erro: a biblioteca 'tiktoken' não está instalada.")
-    print("Execute:  pip install tiktoken")
-    sys.exit(1)
+    trash_venv = "/home/cami/.local/share/Trash/files/HLS_min_dist.2/HLS_min_dist_unified/venv/lib/python3.14/site-packages"
+    if os.path.exists(trash_venv) and trash_venv not in sys.path:
+        sys.path.append(trash_venv)
+    try:
+        import tiktoken
+        from tiktoken.load import load_tiktoken_bpe
+    except ImportError:
+        print("Erro: a biblioteca 'tiktoken' não está instalada.")
+        print("Execute:  pip install tiktoken")
+        sys.exit(1)
+
 
 logger = getLogger(__name__)
 
@@ -685,6 +693,7 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
     """
     Lê o arquivo gerado pelo perf annotate e categoriza o tempo de CPU
     nas instruções da função bitlinear (LOAD, STORE, COMPUTE, CONTROL).
+    Estima também o número de instruções de LOAD executadas.
     """
     result = {
         "total_annotated_pct": 0.0,
@@ -697,6 +706,8 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
         "compute_ratio": 0.0,
         "control_ratio": 0.0,
         "top_instructions": [],
+        "estimated_loads_per_elem": None,
+        "n_loop_loads": 0,
     }
 
     if not os.path.isfile(annotate_file_path):
@@ -708,8 +719,6 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
     except Exception:
         return result
 
-    # Regex para extrair a porcentagem e a instrução
-    # Exemplo: "  25.43 :   401280:   vmovdqu (%rsi,%rax,1),%ymm1"
     pattern = re.compile(
         r"^\s*([0-9]+[.,][0-9]+)\s*:\s*(?:[0-9a-fA-F]+:\s*)?([a-zA-Z0-9._]+)\s*(.*)$"
     )
@@ -758,31 +767,110 @@ def parse_perf_annotate(annotate_file_path: str) -> dict:
     top_insts.sort(key=lambda x: x["pct"], reverse=True)
     result["top_instructions"] = top_insts[:10]
 
+    # --- Contagem de instruções de LOAD no perf annotate ---
+    n_loop_loads = 0
+    has_ymm = False
+    has_xmm = False
+
+    for inst in top_insts:
+        if inst["category"] == "LOAD":
+            n_loop_loads += 1
+            op_str = f"{inst['opcode']} {inst['operands']}".lower()
+            if "%ymm" in op_str:
+                has_ymm = True
+            elif "%xmm" in op_str:
+                has_xmm = True
+
+    if n_loop_loads == 0:
+        for line in lines:
+            line_clean = line.strip()
+            parts = line_clean.split()
+            if len(parts) >= 3 and ":" in line_clean:
+                for idx, p in enumerate(parts):
+                    if p.endswith(":") and idx + 1 < len(parts):
+                        opcode = parts[idx + 1]
+                        operands = " ".join(parts[idx + 2:]) if idx + 2 < len(parts) else ""
+                        cat = classify_instruction(opcode, operands)
+                        if cat == "LOAD":
+                            n_loop_loads += 1
+                            if "%ymm" in operands.lower():
+                                has_ymm = True
+                            elif "%xmm" in operands.lower():
+                                has_xmm = True
+                        break
+
+    step_size = 32.0 if has_ymm else (16.0 if has_xmm else 1.0)
+    if n_loop_loads > 0:
+        result["n_loop_loads"] = n_loop_loads
+        result["estimated_loads_per_elem"] = n_loop_loads / step_size
+
     return result
 
 
-def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
-                          annotate_data: dict = None) -> dict:
+def extract_bitlinear_profiler_info(stdout_str: str) -> dict:
     """
-    Constroi dicionario de analise consolidada de memoria a partir dos
-    dados do perf mem, perf report e perf annotate.
+    Extrai do stdout da simulação o número real de chamadas e elementos
+    processados pela bitlinear durante a inferência.
+    """
+    info = {
+        "bitlinear_calls": 0,
+        "bitlinear_elements": 0,
+    }
+    if not stdout_str:
+        return info
+
+    for line in stdout_str.split("\n"):
+        line_clean = line.strip()
+        if "[PROFILER] Bitlinear calls:" in line_clean:
+            try:
+                info["bitlinear_calls"] = int(line_clean.split(":")[-1].strip())
+            except ValueError:
+                pass
+        elif "[PROFILER] Bitlinear elements:" in line_clean:
+            try:
+                info["bitlinear_elements"] = int(line_clean.split(":")[-1].strip())
+            except ValueError:
+                pass
+
+    return info
+
+
+def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
+                           annotate_data: dict = None, total_inf_time: float = 0.0,
+                           bitlinear_calls: int = 0, bitlinear_elements: int = 0,
+                           bitnet_version: int = 1, comp_name: str = "") -> dict:
+    """
+    Constroi dicionario de analise consolidada de memoria usando o modelo:
+      Tbitlinear = tempo_total_inferencia × overhead_bitlinear
+      Tmem = Nloads × Lmedio
+      TCPU = Tbitlinear − Tmem
+    Onde Lmedio é a latência média dos loads (PEBS) e Nloads é a estimativa
+    do total de instruções de LOAD executadas pela BitLinear durante a inferência,
+    calculado dinamicamente via instrumentação (bitlinear_calls e elementos) e perf annotate.
     """
     analysis: dict = {
         "level_distribution": {},
         "avg_latency_cycles": None,
         "avg_latency_ns": None,
-        "mem_wait_fraction": None,
+        "Lmedio_s": None,
         "bitlinear_overhead_pct": None,
+        "Tbitlinear_s": None,
+        "loads_per_elem": None,
+        "n_loads_per_call": None,
+        "total_bitlinear_calls": None,
+        "Nloads": None,
+        "Tmem_s": None,
+        "TCPU_s": None,
+        "Tmem_pct_bitlinear": None,
+        "TCPU_pct_bitlinear": None,
+        "Tmem_pct_total": None,
+        "TCPU_pct_total": None,
         "annotate": annotate_data or {},
-        "bitlinear_load_cpu_pct": None,
-        "time_lost_mem_pct": None,
-        "time_effective_compute_pct": None,
     }
 
     # Encontrar secao de loads
     load_sec = next((s for s in mem_sections if s["kind"] == "loads"), None)
     if load_sec is not None:
-        # Distribuicao por nivel
         bucket: Dict[str, float] = {
             "L1 hit": 0.0,
             "LFB/MAB hit": 0.0,
@@ -797,14 +885,12 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
             bucket[label] = round(bucket.get(label, 0.0) + lvl["overhead_pct"], 2)
         analysis["level_distribution"] = bucket
 
-        # Latencia media
         avg_cyc = load_sec.get("avg_latency_cycles")
         if avg_cyc is not None:
             analysis["avg_latency_cycles"] = avg_cyc
-            analysis["avg_latency_ns"] = round(avg_cyc / CPU_BASE_CLOCK_GHZ, 3)
-            if avg_cyc > 0:
-                frac = (avg_cyc - L1_IDEAL_LATENCY_CYCLES) / avg_cyc
-                analysis["mem_wait_fraction"] = round(max(frac, 0.0), 4)
+            avg_ns = round(avg_cyc / CPU_BASE_CLOCK_GHZ, 3)
+            analysis["avg_latency_ns"] = avg_ns
+            analysis["Lmedio_s"] = (avg_cyc / CPU_BASE_CLOCK_GHZ) * 1e-9
 
     # Percentagem de CPU da bitlinear (extraida do top 10)
     bitlinear_pct = 0.0
@@ -817,28 +903,55 @@ def build_memory_analysis(mem_sections: List[dict], top_functions: List[dict],
                 )
             except ValueError:
                 pass
+
     if bitlinear_pct > 0:
         analysis["bitlinear_overhead_pct"] = round(bitlinear_pct, 2)
-        frac = analysis.get("mem_wait_fraction")
+        if total_inf_time > 0:
+            t_bitlinear = total_inf_time * (bitlinear_pct / 100.0)
+            analysis["Tbitlinear_s"] = round(t_bitlinear, 6)
 
-        ann = annotate_data or {}
-        load_ratio = ann.get("load_ratio")
-
-        if load_ratio is not None and ann.get("total_annotated_pct", 0) > 0:
-            load_cpu_pct = bitlinear_pct * load_ratio
-            analysis["bitlinear_load_cpu_pct"] = round(load_cpu_pct, 2)
-            if frac is not None:
-                lost_mem = load_cpu_pct * frac
-                analysis["time_lost_mem_pct"] = round(lost_mem, 2)
-                analysis["time_effective_compute_pct"] = round(bitlinear_pct - lost_mem, 2)
+    # Estimativa dinâmica de Nloads a partir de instrumentação real e perf annotate
+    ann = annotate_data or {}
+    loads_per_elem = ann.get("estimated_loads_per_elem")
+    if loads_per_elem is None or loads_per_elem <= 0:
+        comp_upper = comp_name.upper()
+        if "SIMD" in comp_upper or "ACCUMULATED" in comp_upper or "O3" in comp_upper:
+            if bitnet_version == 2:
+                loads_per_elem = 2.0 / 128.0
             else:
-                analysis["time_effective_compute_pct"] = round(bitlinear_pct, 2)
-        elif frac is not None:
-            analysis["time_lost_mem_pct"] = round(bitlinear_pct * frac, 2)
-            analysis["time_effective_compute_pct"] = round(
-                bitlinear_pct * (1.0 - frac), 2
-            )
+                loads_per_elem = 2.0 / 32.0
+        elif "UNROLL" in comp_upper:
+            loads_per_elem = 2.0 / 4.0
+        else:
+            loads_per_elem = 2.0
 
+    if bitlinear_calls > 0 and bitlinear_elements > 0:
+        avg_elems_per_call = bitlinear_elements / float(bitlinear_calls)
+        n_loads_per_call = avg_elems_per_call * loads_per_elem
+        Nloads = int(round(n_loads_per_call * bitlinear_calls))
+    else:
+        n_loads_per_call = 0
+        Nloads = 0
+
+    analysis["loads_per_elem"] = round(loads_per_elem, 6)
+    analysis["n_loads_per_call"] = int(round(n_loads_per_call))
+    analysis["total_bitlinear_calls"] = bitlinear_calls
+    analysis["Nloads"] = Nloads
+
+    Lmedio_s = analysis.get("Lmedio_s")
+    t_bitlinear = analysis.get("Tbitlinear_s")
+
+    if Lmedio_s is not None and t_bitlinear is not None and t_bitlinear > 0:
+        Tmem_s = Nloads * Lmedio_s
+        TCPU_s = max(0.0, t_bitlinear - Tmem_s)
+
+        analysis["Tmem_s"] = round(Tmem_s, 6)
+        analysis["TCPU_s"] = round(TCPU_s, 6)
+        analysis["Tmem_pct_bitlinear"] = round((Tmem_s / t_bitlinear) * 100.0, 2)
+        analysis["TCPU_pct_bitlinear"] = round((TCPU_s / t_bitlinear) * 100.0, 2)
+        if total_inf_time > 0:
+            analysis["Tmem_pct_total"] = round((Tmem_s / total_inf_time) * 100.0, 2)
+            analysis["TCPU_pct_total"] = round((TCPU_s / total_inf_time) * 100.0, 2)
     return analysis
 
 
@@ -1142,8 +1255,17 @@ def main():
                 print("    (sem dados -- verificar suporte a PEBS/perf mem)")
 
             # --- Analise consolidada de memoria ---
-            memory_analysis = build_memory_analysis(mem_sections, top_fns, annotate_data)
-            print("\n  [Analise de Memoria -- Impacto na BitLinear]")
+            total_inf_time = sim_metrics["timings"].get("Total Inference", 0.0)
+            prof_info = extract_bitlinear_profiler_info(stdout_str)
+            memory_analysis = build_memory_analysis(
+                mem_sections, top_fns, annotate_data,
+                total_inf_time=total_inf_time,
+                bitlinear_calls=prof_info["bitlinear_calls"],
+                bitlinear_elements=prof_info["bitlinear_elements"],
+                bitnet_version=args.version,
+                comp_name=comp["name"]
+            )
+            print("\n  [Analise de Memoria -- Impacto na BitLinear (Modelo Tbitlinear = Tmem + TCPU)]")
             ann = memory_analysis.get("annotate", {})
             if ann and ann.get("total_annotated_pct", 0) > 0:
                 print("    Distribuicao de Instrucoes na BitLinear (perf annotate):")
@@ -1156,20 +1278,16 @@ def main():
                 print("    Distribuicao de loads por nivel:")
                 for lv, pct in dist.items():
                     print(f"      {lv:<12}: {pct:>6.2f}%")
-            if memory_analysis["avg_latency_cycles"] is not None:
-                print(f"    Latencia media loads : {memory_analysis['avg_latency_cycles']} ciclos "
-                      f"/ {memory_analysis['avg_latency_ns']} ns")
-            if memory_analysis["mem_wait_fraction"] is not None:
-                print(f"    Fracao de espera mem : {memory_analysis['mem_wait_fraction']:.4f} "
-                      f"(L1 ideal = {L1_IDEAL_LATENCY_CYCLES} ciclos)")
-            if memory_analysis["bitlinear_overhead_pct"] is not None:
-                print(f"    Overhead bitlinear   : {memory_analysis['bitlinear_overhead_pct']:.2f}% de CPU total")
-                if memory_analysis.get("bitlinear_load_cpu_pct") is not None:
-                    print(f"    Tempo c/ instrs LOAD : {memory_analysis['bitlinear_load_cpu_pct']:.2f}% de CPU total")
-                if memory_analysis.get("time_lost_mem_pct") is not None:
-                    print(f"    Tempo perdido c/ mem : {memory_analysis['time_lost_mem_pct']:.2f}% de CPU total (stall de LOAD)")
-                if memory_analysis.get("time_effective_compute_pct") is not None:
-                    print(f"    Tempo efetivo comput : {memory_analysis['time_effective_compute_pct']:.2f}% de CPU total (SIMD + exec ativa)")
+            if memory_analysis.get("avg_latency_cycles") is not None:
+                print(f"    Latencia media loads (Lmedio) : {memory_analysis['avg_latency_cycles']} ciclos / {memory_analysis['avg_latency_ns']} ns ({memory_analysis.get('Lmedio_s', 0):.9e} s)")
+            if memory_analysis.get("Nloads") is not None:
+                print(f"    Nloads (estimado bitlinear)   : {memory_analysis['Nloads']:,} loads ({memory_analysis.get('n_loads_per_call', 0):,} loads/chamada | {memory_analysis.get('total_bitlinear_calls', 0):,} chamadas)")
+            if memory_analysis.get("Tbitlinear_s") is not None:
+                print(f"    Tbitlinear (tempo bitlinear) : {memory_analysis['Tbitlinear_s']:.6f} s ({memory_analysis.get('bitlinear_overhead_pct', 0):.2f}% da inferencia)")
+            if memory_analysis.get("Tmem_s") is not None:
+                print(f"    Tmem (Nloads x Lmedio)       : {memory_analysis['Tmem_s']:.6f} s ({memory_analysis.get('Tmem_pct_bitlinear', 0):.2f}% de Tbitlinear | {memory_analysis.get('Tmem_pct_total', 0):.2f}% do total)")
+            if memory_analysis.get("TCPU_s") is not None:
+                print(f"    TCPU (Tbitlinear - Tmem)      : {memory_analysis['TCPU_s']:.6f} s ({memory_analysis.get('TCPU_pct_bitlinear', 0):.2f}% de Tbitlinear | {memory_analysis.get('TCPU_pct_total', 0):.2f}% do total)")
 
             print("\n" + "-" * 50)
 
@@ -1280,7 +1398,7 @@ def main():
                 md_report.append("  (sem dados nesta execucao)")
             md_report.append("")
 
-            md_report.append("#### Analise de Memoria -- Impacto na BitLinear")
+            md_report.append("#### Analise de Memoria -- Impacto na BitLinear (Modelo Tbitlinear = Tmem + TCPU)")
             ma = run.get("memory_analysis", {})
             ann = ma.get("annotate", {})
             if ann and ann.get("total_annotated_pct", 0) > 0:
@@ -1310,30 +1428,29 @@ def main():
                 md_report.append("")
             if ma.get("avg_latency_cycles") is not None:
                 md_report.append(
-                    f"  Latencia media loads : {ma['avg_latency_cycles']} ciclos "
-                    f"/ {ma['avg_latency_ns']} ns"
+                    f"  Latencia media loads (Lmedio) : {ma['avg_latency_cycles']} ciclos "
+                    f"/ {ma['avg_latency_ns']} ns ({ma.get('Lmedio_s', 0):.9e} s)"
                 )
-            if ma.get("mem_wait_fraction") is not None:
+            if ma.get("Nloads") is not None:
                 md_report.append(
-                    f"  Fracao de espera mem : {ma['mem_wait_fraction']:.4f} "
-                    f"(L1 ideal = {L1_IDEAL_LATENCY_CYCLES} ciclos)"
+                    f"  Nloads (estimado bitlinear)   : {ma['Nloads']:,} loads "
+                    f"({ma.get('n_loads_per_call', 0):,} loads/chamada | {ma.get('total_bitlinear_calls', 0):,} chamadas)"
                 )
-            if ma.get("bitlinear_overhead_pct") is not None:
+            if ma.get("Tbitlinear_s") is not None:
                 md_report.append(
-                    f"  Overhead bitlinear   : {ma['bitlinear_overhead_pct']:.2f}% de CPU"
+                    f"  Tbitlinear (tempo bitlinear) : {ma['Tbitlinear_s']:.6f} s "
+                    f"({ma.get('bitlinear_overhead_pct', 0):.2f}% da inferencia)"
                 )
-                if ma.get("bitlinear_load_cpu_pct") is not None:
-                    md_report.append(
-                        f"  Tempo c/ instrs LOAD : {ma['bitlinear_load_cpu_pct']:.2f}% de CPU total"
-                    )
-                if ma.get("time_lost_mem_pct") is not None:
-                    md_report.append(
-                        f"  Tempo perdido c/ mem : {ma['time_lost_mem_pct']:.2f}% de CPU total (stall de LOAD)"
-                    )
-                if ma.get("time_effective_compute_pct") is not None:
-                    md_report.append(
-                        f"  Tempo efetivo comput : {ma['time_effective_compute_pct']:.2f}% de CPU total (SIMD + exec ativa)"
-                    )
+            if ma.get("Tmem_s") is not None:
+                md_report.append(
+                    f"  Tmem (Nloads x Lmedio)       : {ma['Tmem_s']:.6f} s "
+                    f"({ma.get('Tmem_pct_bitlinear', 0):.2f}% de Tbitlinear | {ma.get('Tmem_pct_total', 0):.2f}% do total)"
+                )
+            if ma.get("TCPU_s") is not None:
+                md_report.append(
+                    f"  TCPU (Tbitlinear - Tmem)      : {ma['TCPU_s']:.6f} s "
+                    f"({ma.get('TCPU_pct_bitlinear', 0):.2f}% de Tbitlinear | {ma.get('TCPU_pct_total', 0):.2f}% do total)"
+                )
             if not dist and ma.get("avg_latency_cycles") is None:
                 md_report.append("  (sem dados de memoria nesta execucao)")
             md_report.append("")
